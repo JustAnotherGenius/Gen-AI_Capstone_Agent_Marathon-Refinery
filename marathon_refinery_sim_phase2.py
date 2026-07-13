@@ -352,6 +352,12 @@ def _apply_faults(p):
     """Re-impose active fault effects each tick (persistent until cleared).
     Returns the combined 'adjustments' dict for run_refinery."""
     e, c, k, F = p["economics"], p["crude"], p["knobs"], p["active_faults"]
+    # Record each fault's start tick the first time we see it (nice-to-have
+    # #5: lets the UI show "active for Xs" on the fault buttons). Additive
+    # only -- doesn't change the existing active_faults list shape at all.
+    for fault_dict in F.values():
+        if "started_tick" not in fault_dict:
+            fault_dict["started_tick"] = p["tick"]
     adj = dict(DEFAULT_ADJUSTMENTS)
     if "scenario_A_gasoline_opportunity" in F:
         e["gasoline_crack_usd_bbl"] = 39.0; e["gasoline_demand_bpd"] = 135_000
@@ -383,6 +389,12 @@ def step(plant=PLANT):
                                   plant["crude"], adjustments=adj)
     plant["state"]["tick"] = plant["tick"]
     plant["state"]["active_faults"] = list(plant["active_faults"].keys())
+    # additive: per-fault duration, for the fault-pill "active for Xs" badge
+    plant["state"]["fault_details"] = [
+        {"name": name, "started_tick": info.get("started_tick", plant["tick"]),
+         "duration_ticks": plant["tick"] - info.get("started_tick", plant["tick"])}
+        for name, info in plant["active_faults"].items()
+    ]
     return plant["state"]
 
 # ============================================================================

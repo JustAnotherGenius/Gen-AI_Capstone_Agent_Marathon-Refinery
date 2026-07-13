@@ -46,7 +46,7 @@ from marathon_refinery_sim_phase2 import (
 
 LLM_CONFIG = {
     "mode": "MOCK",                 # "MOCK" | "LIVE" | "REPLAY"
-    "model": "llama-3.3-70b-versatile",   # Groq model (used in LIVE)
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",   # Groq model (used in LIVE)
     "temperature": 0.2,             # low = consistent, non-creative reasoning
     "max_tokens": 1024,
     "timeout_s": 30,
@@ -105,11 +105,14 @@ def _get_api_key():
     return os.environ.get(LLM_CONFIG["api_key_env"])
 
 
-def _call_groq_live(system_prompt, user_prompt):
+def _call_groq_live(system_prompt, user_prompt, api_key_override=None):
     """Real Groq call. Only invoked in LIVE mode. Imported lazily so the
-    module works without the groq package installed (MOCK/REPLAY)."""
+    module works without the groq package installed (MOCK/REPLAY).
+    api_key_override: if given (e.g. a visitor's own pasted key from the
+    dashboard), use it instead of the shared project key -- lets each
+    browser session bring its own key without touching global state."""
     from groq import Groq
-    key = _get_api_key()
+    key = api_key_override or _get_api_key()
     if not key:
         raise RuntimeError(
             f"No API key found. In Colab: add '{LLM_CONFIG['api_key_env']}' in the "
@@ -126,18 +129,31 @@ def _call_groq_live(system_prompt, user_prompt):
     return resp.choices[0].message.content
 
 
-def call_llm(agent_name, system_prompt, user_prompt, context, expect_json=True):
+def call_llm(agent_name, system_prompt, user_prompt, context, expect_json=True,
+             session_ctx=None):
     """The single entry point for every agent's LLM interaction.
 
     agent_name  : identifies the agent (for mock routing, caching, fallback)
     system/user : the prompts (written now; used live later)
     context     : dict the MOCK responder reads to build a shaped reply
     expect_json : if True, response is parsed to a dict; else returned as text
+    session_ctx : optional dict {"session_id", "mode", "api_key"} -- when
+                  given (always the case from the multi-user dashboard),
+                  its mode/key OVERRIDE the global LLM_CONFIG for THIS call
+                  only, and fallback caches are kept per-session so two
+                  browser tabs never see each other's degraded/cached state.
+                  When None (e.g. the standalone Colab test harness), the
+                  original global-LLM_CONFIG behavior is used unchanged.
 
     Returns: parsed dict (expect_json) or str. On total failure, returns the
     agent's last-good output, or a minimal safe stub - never raises upward."""
-    mode = LLM_CONFIG["mode"]
-    cache_key = agent_name
+    ctx = session_ctx or {}
+    mode = ctx.get("mode", LLM_CONFIG["mode"])
+    api_key_override = ctx.get("api_key")
+    # per-session cache namespace -- falls back to the shared global cache
+    # when no session_id is given, preserving old single-user behavior.
+    sid = ctx.get("session_id", "_global")
+    cache_key = f"{sid}::{agent_name}"
 
     try:
         if mode == "MOCK":
@@ -164,7 +180,8 @@ def call_llm(agent_name, system_prompt, user_prompt, context, expect_json=True):
                 try:
                     nudge = ("" if attempt == 0 else
                              "\n\nIMPORTANT: return ONLY valid JSON, no prose.")
-                    raw = _call_groq_live(system_prompt, user_prompt + nudge)
+                    raw = _call_groq_live(system_prompt, user_prompt + nudge,
+                                          api_key_override=api_key_override)
                     _REPLAY_CACHE[cache_key] = raw     # capture for REPLAY
                     result = _extract_json(raw) if expect_json else raw
                     break
@@ -178,7 +195,8 @@ def call_llm(agent_name, system_prompt, user_prompt, context, expect_json=True):
                         for _ in range(LLM_CONFIG.get("rate_limit_retries", 3)):
                             time.sleep(cooldown)
                             try:
-                                raw = _call_groq_live(system_prompt, user_prompt)
+                                raw = _call_groq_live(system_prompt, user_prompt,
+                                                      api_key_override=api_key_override)
                                 _REPLAY_CACHE[cache_key] = raw
                                 result = _extract_json(raw) if expect_json else raw
                                 last_err = None
@@ -290,11 +308,12 @@ def _build_monitoring_prompt(snapshot):
     return (f"Current plant state digest:\n{json.dumps(d, indent=2)}\n\n"
             f"Diagnose the plant. Return the JSON.")
 
-def monitoring_agent(snapshot):
+def monitoring_agent(snapshot, session_ctx=None):
     """Agent 1. Reads snapshot -> diagnosis JSON."""
     user = _build_monitoring_prompt(snapshot)
     return call_llm("monitoring", MONITORING_SYSTEM_PROMPT, user,
-                    context={"snapshot": snapshot}, expect_json=True)
+                    context={"snapshot": snapshot}, expect_json=True,
+                    session_ctx=session_ctx)
 
 
 # ------------------------------------------------------------- OPTIMIZATION
@@ -333,14 +352,14 @@ def _build_optimization_prompt(snapshot, diagnosis, counter_guidance=None):
     parts.append("\nPropose knob changes. Return the JSON.")
     return "\n".join(parts)
 
-def optimization_agent(snapshot, diagnosis, counter_guidance=None):
+def optimization_agent(snapshot, diagnosis, counter_guidance=None, session_ctx=None):
     """Agent 2. Proposes knobs, then GROUNDS via simulate_proposal().
     Returns the proposal enriched with the tool's true predicted numbers."""
     user = _build_optimization_prompt(snapshot, diagnosis, counter_guidance)
     proposal = call_llm("optimization", OPTIMIZATION_SYSTEM_PROMPT, user,
                         context={"snapshot": snapshot, "diagnosis": diagnosis,
                                  "counter_guidance": counter_guidance},
-                        expect_json=True)
+                        expect_json=True, session_ctx=session_ctx)
     # --- TOOL GROUNDING: numbers come from simulate_proposal(), never invented
     changes = proposal.get("proposed_changes", {})
     try:
@@ -390,14 +409,14 @@ def _build_safety_prompt(proposal, limit_report):
             f"{json.dumps(limit_report, indent=2)}\n\n"
             f"Issue your verdict. Return the JSON.")
 
-def safety_agent(proposal):
+def safety_agent(proposal, session_ctx=None):
     """Agent 3. Runs check_all_limits() on the predicted state, then verdicts."""
     predicted = proposal.get("predicted_state")
     limit_report = check_all_limits(predicted)
     user = _build_safety_prompt(proposal, limit_report)
     verdict = call_llm("safety", SAFETY_SYSTEM_PROMPT, user,
                        context={"proposal": proposal, "limit_report": limit_report},
-                       expect_json=True)
+                       expect_json=True, session_ctx=session_ctx)
     verdict["_limit_report"] = limit_report   # attach ground truth for the log
     return verdict
 
@@ -507,9 +526,11 @@ def log_summary(n=None):
 # 1-3 for other runs, but 2 is the correct default here.
 ORCH_CONFIG = {"max_loops": 2}   # counter-proposal rounds (config 1-3; default 2)
 
-def run_advisory_cycle(snapshot=None, verbose=False):
+def run_advisory_cycle(snapshot=None, verbose=False, session_ctx=None):
     """One full advisory pass over an immutable snapshot. Returns a card:
-       {status, monitoring, optimization, safety, applied_changes, loops, outcome}"""
+       {status, monitoring, optimization, safety, applied_changes, loops, outcome}
+    session_ctx: optional per-browser-session {"session_id","mode","api_key"}
+    -- see call_llm() docstring. None = old global-LLM_CONFIG behavior."""
     if snapshot is None:
         snapshot = get_refinery_state()          # immutable deep copy (audit #3)
 
@@ -518,7 +539,7 @@ def run_advisory_cycle(snapshot=None, verbose=False):
             "loops": 0}
 
     # --- MONITOR ---
-    diagnosis = monitoring_agent(snapshot)
+    diagnosis = monitoring_agent(snapshot, session_ctx=session_ctx)
     card["monitoring"] = diagnosis
     if verbose:
         degraded = diagnosis.get("_degraded")
@@ -530,8 +551,9 @@ def run_advisory_cycle(snapshot=None, verbose=False):
     counter_guidance = None
     for loop in range(ORCH_CONFIG["max_loops"] + 1):
         card["loops"] = loop + 1
-        proposal = optimization_agent(snapshot, diagnosis, counter_guidance)
-        verdict = safety_agent(proposal)
+        proposal = optimization_agent(snapshot, diagnosis, counter_guidance,
+                                      session_ctx=session_ctx)
+        verdict = safety_agent(proposal, session_ctx=session_ctx)
         attempt = {"loop": loop + 1,
                    "proposed_changes": proposal.get("proposed_changes", {}),
                    "predicted_margin_delta_usd_day":
@@ -584,7 +606,7 @@ def apply_recommendation(card, plant=PLANT):
 #  Nothing bypasses Safety. Returns Safety's verdict; only applies if safe.
 # ============================================================================
 
-def operator_manual_change(knob_changes, plant=PLANT, apply_if_safe=True):
+def operator_manual_change(knob_changes, plant=PLANT, apply_if_safe=True, session_ctx=None):
     """Operator drags a slider / sets a value. Route through Safety first."""
     snapshot = get_refinery_state(plant)
     # build a proposal shell so we can reuse the Safety agent
@@ -598,7 +620,7 @@ def operator_manual_change(knob_changes, plant=PLANT, apply_if_safe=True):
                     "fcc_coke_pct": round(predicted["coke_make_pct"], 2),
                     "h2_demand_MMscfd": round(predicted["h2_demand_scfd"] / 1e6, 2),
                     "h2_available_MMscfd": round(predicted["h2_available_scfd"] / 1e6, 2)}}
-    verdict = safety_agent(proposal)
+    verdict = safety_agent(proposal, session_ctx=session_ctx)
     log_event("manual_change",
               f"operator set {knob_changes} -> Safety {verdict.get('verdict')}",
               snapshot)
@@ -665,7 +687,49 @@ def _parse_whatif(question):
             return {knob: clamp_knob(knob, val)}
     return None
 
-def operator_assistant(question, uploaded_text=None, plant=PLANT):
+def _relevant_manual_excerpt(question, budget=5000):
+    """Pick the manual content most relevant to THIS question, instead of a
+    blind first-N-characters truncation. With three manuals combined into
+    ~51K chars, a flat slice would only ever show the start of the first
+    file -- meaning a question about a later section would never see it,
+    regardless of any rate-limit budget. This is NOT retrieval/embeddings
+    (we deliberately stayed away from that complexity) -- it's a simple,
+    dependency-free keyword-overlap heuristic: split the manual into
+    paragraphs, score each by how many question-words it contains, and
+    concatenate the top-scoring ones up to the character budget. Falls back
+    to a plain leading slice if the question shares no words with the text
+    at all (e.g. a very generic greeting)."""
+    if not USER_MANUAL_TEXT:
+        return ""
+    words = set(re.findall(r"[a-z0-9]{3,}", question.lower()))
+    if not words:
+        return USER_MANUAL_TEXT[:budget]
+
+    paragraphs = [p for p in re.split(r"\n\s*\n", USER_MANUAL_TEXT) if p.strip()]
+    scored = []
+    for i, p in enumerate(paragraphs):
+        p_words = set(re.findall(r"[a-z0-9]{3,}", p.lower()))
+        score = len(words & p_words)
+        if score > 0:
+            scored.append((score, i, p))
+
+    if not scored:
+        return USER_MANUAL_TEXT[:budget]   # no overlap -- safe fallback
+
+    scored.sort(key=lambda x: (-x[0], x[1]))   # best matches first
+    picked, total = [], 0
+    for score, idx, p in scored:
+        if total + len(p) > budget and picked:
+            break
+        picked.append((idx, p))
+        total += len(p)
+        if total >= budget:
+            break
+    picked.sort(key=lambda x: x[0])             # restore original reading order
+    return "\n\n".join(p for _, p in picked)
+
+
+def operator_assistant(question, uploaded_text=None, plant=PLANT, session_ctx=None):
     """Agent 4. Conversational, preview-only. Routes what-if queries through
     simulate_proposal(); answers manual/data/file questions from context."""
     snapshot = get_refinery_state(plant)
@@ -690,8 +754,8 @@ def operator_assistant(question, uploaded_text=None, plant=PLANT):
     context = {"question": question,
                "whatif_result": whatif_result,
                "state_digest": _state_digest(snapshot),
-               "manual_excerpt": USER_MANUAL_TEXT[:12000],
-               "uploaded_text": (uploaded_text or "")[:4000],
+               "manual_excerpt": _relevant_manual_excerpt(question, budget=5000),
+               "uploaded_text": (uploaded_text or "")[:3000],
                "recent_log": log_summary(n=8)}
     user = (f"Operator question: {question}\n\n"
             + (f"What-if tool result:\n{json.dumps(whatif_result, indent=2)}\n\n"
@@ -703,7 +767,7 @@ def operator_assistant(question, uploaded_text=None, plant=PLANT):
             + f"Recent events:\n{context['recent_log']}\n\n"
             + "Answer the operator concisely and correctly.")
     answer = call_llm("assistant", ASSISTANT_SYSTEM_PROMPT, user,
-                      context=context, expect_json=False)
+                      context=context, expect_json=False, session_ctx=session_ctx)
     return {"answer": answer, "whatif_result": whatif_result}
 
 
